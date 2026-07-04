@@ -163,8 +163,27 @@ POST_HOOK="ufw delete allow 8443/tcp && ufw reload"
 ACME_ECC_DIR="${HOME}/.acme.sh/${DOMAIN}_ecc"
 ACME_RSA_DIR="${HOME}/.acme.sh/${DOMAIN}"
 
-if [ -f "$CERT_PEM" ] && [ -f "$CERT_KEY" ]; then
-    echo "SSL certificates already exist at $CERT_PEM. Skipping initial issuance."
+# Standard certbot / letsencrypt-auto layout
+LE_LIVE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+
+# Tracks where the certificate actually came from, used later to decide
+# how to wire up auto-renewal.
+CERT_SOURCE=""
+
+if [ -f "$LE_LIVE_DIR/fullchain.pem" ] && [ -f "$LE_LIVE_DIR/privkey.pem" ]; then
+    echo "Found a certbot/Let's Encrypt certificate for $DOMAIN in $LE_LIVE_DIR. Using it..."
+    # -L to dereference the symlinks certbot creates in the live/ folder.
+    # Checked FIRST and unconditionally (even if nginx already has a copy
+    # from a previous run) so a certbot-issued cert is always recognized as
+    # such and always gets the certbot renewal hook below — not acme.sh.
+    cp -L "$LE_LIVE_DIR/fullchain.pem" "$CERT_PEM"
+    cp -L "$LE_LIVE_DIR/privkey.pem" "$CERT_KEY"
+    chmod 600 "$CERT_KEY"
+    CERT_SOURCE="letsencrypt_live"
+
+elif [ -f "$CERT_PEM" ] && [ -f "$CERT_KEY" ]; then
+    echo "SSL certificates already exist at $CERT_PEM (no matching /etc/letsencrypt/live entry). Skipping initial issuance."
+    CERT_SOURCE="nginx_existing"
 
 elif [ -f "$ACME_ECC_DIR/fullchain.cer" ] && [ -f "$ACME_ECC_DIR/${DOMAIN}.key" ]; then
     echo "Certificate for $DOMAIN already exists in acme.sh cache. Installing to Nginx directory..."
@@ -172,28 +191,72 @@ elif [ -f "$ACME_ECC_DIR/fullchain.cer" ] && [ -f "$ACME_ECC_DIR/${DOMAIN}.key" 
         --key-file "$CERT_KEY" \
         --fullchain-file "$CERT_PEM" \
         --ecc
+    CERT_SOURCE="acme_ecc"
 
 elif [ -f "$ACME_RSA_DIR/fullchain.cer" ] && [ -f "$ACME_RSA_DIR/${DOMAIN}.key" ]; then
     echo "RSA Certificate for $DOMAIN already exists in acme.sh cache. Installing to Nginx directory..."
     ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
         --key-file "$CERT_KEY" \
         --fullchain-file "$CERT_PEM"
+    CERT_SOURCE="acme_rsa"
 
 else
-    echo "No existing certificates found. Issuing a new one via standalone ALPN..."
-    
-    if ! ~/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" \
-        --key-file "$CERT_KEY" \
-        --fullchain-file "$CERT_PEM" \
-        --alpn --tlsport 8443; then
-        
-        if [ -f "$ACME_ECC_DIR/fullchain.cer" ]; then
-            echo "Issue reported an error, but certificate files were found. Copying..."
-            ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$CERT_KEY" --fullchain-file "$CERT_PEM" --ecc
-        else
-            echo "Error: Failed to issue SSL certificate."
+    echo "No existing certificates found."
+    echo "Select SSL validation method:"
+    echo "1) Standalone (HTTP/TLS-ALPN-01 on port 8443 - requires this port reachable from the internet)"
+    echo "2) DNS-01 via Cloudflare (certbot + API Token only, no inbound port needed)"
+    read -p "Enter choice [1-2]: " VALIDATION_CHOICE
+
+    if [ "$VALIDATION_CHOICE" == "2" ]; then
+        echo "--- Cloudflare DNS-01 challenge (certbot) ---"
+        ask_variable "CF_Token" "Cloudflare API Token (Zone:DNS:Edit permission for the zone of $DOMAIN)"
+
+        # Persist for reuse on future re-runs
+        echo "CF_Token=$CF_Token" >> "$ENV_FILE"
+
+        echo "Installing certbot + Cloudflare DNS plugin..."
+        sudo apt-get update
+        sudo apt-get install -y certbot python3-certbot-dns-cloudflare
+
+        CF_INI="/opt/remnanode/cloudflare.ini"
+        cat <<EOF > "$CF_INI"
+dns_cloudflare_api_token = $CF_Token
+EOF
+        chmod 600 "$CF_INI"
+
+        echo "Issuing certificate via Cloudflare DNS-01..."
+        if ! certbot certonly \
+            --dns-cloudflare \
+            --dns-cloudflare-credentials "$CF_INI" \
+            -d "$DOMAIN" \
+            --non-interactive --agree-tos -m "$EMAIL"; then
+            echo "Error: Failed to issue SSL certificate via Cloudflare DNS-01."
+            echo "Check that the API Token has Zone:DNS:Edit permission for $DOMAIN."
             exit 1
         fi
+
+        # certbot stores the cert under /etc/letsencrypt/live/$DOMAIN — reuse
+        # the same handling (and renewal path) as an already-existing cert.
+        cp -L "$LE_LIVE_DIR/fullchain.pem" "$CERT_PEM"
+        cp -L "$LE_LIVE_DIR/privkey.pem" "$CERT_KEY"
+        chmod 600 "$CERT_KEY"
+        CERT_SOURCE="letsencrypt_live"
+    else
+        echo "Issuing a new certificate via standalone ALPN..."
+        if ! ~/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" \
+            --key-file "$CERT_KEY" \
+            --fullchain-file "$CERT_PEM" \
+            --alpn --tlsport 8443; then
+
+            if [ -f "$ACME_ECC_DIR/fullchain.cer" ]; then
+                echo "Issue reported an error, but certificate files were found. Copying..."
+                ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$CERT_KEY" --fullchain-file "$CERT_PEM" --ecc
+            else
+                echo "Error: Failed to issue SSL certificate."
+                exit 1
+            fi
+        fi
+        CERT_SOURCE="acme_new"
     fi
 fi
 
@@ -220,7 +283,7 @@ ask_variable "GRPC_PATH" "gRPC Service Name/Path (e.g., /grpcpath)"
 
     [[ "$XHTTP_PATH" != /* ]] && XHTTP_PATH="/$XHTTP_PATH"
     [[ "$XHTTP_PATH" != */ ]] && XHTTP_PATH="$XHTTP_PATH/"
-    
+
     [[ "$GRPC_PATH" != /* ]] && GRPC_PATH="/$GRPC_PATH"
 
     echo "XHTTP_PATH=$XHTTP_PATH" >> "$ENV_FILE"
@@ -349,17 +412,76 @@ sudo ufw --force enable
 
 echo "Configuring automatic renewal via crontab..."
 
-~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
-    --key-file "$CERT_KEY" \
-    --fullchain-file "$CERT_PEM" \
-    --pre-hook "$PRE_HOOK" \
-    --post-hook "$POST_HOOK" \
-    --reloadcmd "docker compose -f /opt/remnanode/nginx/docker-compose.yml restart && docker compose -f /opt/remnanode/docker-compose.yml restart"
+# acme.sh stores each cert under either ~/.acme.sh/$DOMAIN (RSA) or
+# ~/.acme.sh/${DOMAIN}_ecc (ECC, the default for new issuances). The
+# install-cert call below needs the matching --ecc flag or it will fail
+# with "is not a cert name" / "Cannot find path", so detect it here instead
+# of assuming RSA.
+ACME_CERT_FLAG=""
+if [ "$CERT_SOURCE" != "letsencrypt_live" ]; then
+    if [ -d "$ACME_ECC_DIR" ]; then
+        ACME_CERT_FLAG="--ecc"
+    elif [ -d "$ACME_RSA_DIR" ]; then
+        ACME_CERT_FLAG=""
+    else
+        # Cert files exist on disk but acme.sh has no record of issuing them
+        # (e.g. manually placed certs). Nothing to hook renewal into.
+        CERT_SOURCE="unmanaged"
+    fi
+fi
 
-CRON_JOB="0 0 * * * \"${HOME}/.acme.sh\"/acme.sh --cron --home \"${HOME}/.acme.sh\" > /dev/null"
-(crontab -l 2>/dev/null | grep -F "acme.sh --cron" || (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -)
+if [ "$CERT_SOURCE" == "letsencrypt_live" ]; then
+    # Cert is managed by certbot (either it pre-existed, or we just issued it
+    # via the Cloudflare DNS-01 plugin) — let certbot keep renewing it and
+    # just sync + restart when it does, instead of asking acme.sh to manage
+    # a domain it never issued.
+    echo "Certificate is managed by certbot ($LE_LIVE_DIR)."
+    echo "Setting up a certbot deploy-hook to sync renewed certs and restart services..."
 
-echo "Cron task successfully configured/verified."
+    sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+
+    sudo tee "/etc/letsencrypt/renewal-hooks/deploy/remnanode-sync.sh" > /dev/null <<HOOKEOF
+#!/bin/bash
+# Auto-generated by remnanode install script.
+# Copies the renewed certificate into the nginx dir and restarts the stack,
+# but only if the renewed domain matches the one this node uses.
+case ",\${RENEWED_DOMAINS// /,}," in
+  *",$DOMAIN,"*)
+    cp -L "$LE_LIVE_DIR/fullchain.pem" "$CERT_PEM"
+    cp -L "$LE_LIVE_DIR/privkey.pem" "$CERT_KEY"
+    chmod 600 "$CERT_KEY"
+    docker compose -f /opt/remnanode/nginx/docker-compose.yml restart
+    docker compose -f /opt/remnanode/docker-compose.yml restart
+    ;;
+esac
+HOOKEOF
+    sudo chmod +x "/etc/letsencrypt/renewal-hooks/deploy/remnanode-sync.sh"
+
+    # Make sure certbot itself is actually being renewed periodically.
+    # (If the cert was issued via the Cloudflare plugin, certbot already
+    # remembers the credentials file path and will renew it the same way.)
+    if ! crontab -l 2>/dev/null | grep -qF "certbot renew"; then
+        (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
+    fi
+
+    echo "Certbot deploy-hook and renewal cron task configured."
+elif [ "$CERT_SOURCE" == "unmanaged" ]; then
+    echo "Warning: certificate files exist at $CERT_PEM but acme.sh has no record of issuing them"
+    echo "(checked $ACME_ECC_DIR and $ACME_RSA_DIR). Skipping automatic renewal setup for it —"
+    echo "please configure renewal manually for this certificate."
+else
+    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" $ACME_CERT_FLAG \
+        --key-file "$CERT_KEY" \
+        --fullchain-file "$CERT_PEM" \
+        --pre-hook "$PRE_HOOK" \
+        --post-hook "$POST_HOOK" \
+        --reloadcmd "docker compose -f /opt/remnanode/nginx/docker-compose.yml restart && docker compose -f /opt/remnanode/docker-compose.yml restart"
+
+    CRON_JOB="0 0 * * * \"${HOME}/.acme.sh\"/acme.sh --cron --home \"${HOME}/.acme.sh\" > /dev/null"
+    (crontab -l 2>/dev/null | grep -F "acme.sh --cron" || (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -)
+
+    echo "Cron task successfully configured/verified."
+fi
 
 echo "--- [8/8] Installing WARP CLI ---"
 chmod +x warp.sh
@@ -369,6 +491,7 @@ echo "------------------------------------------------"
 echo "INSTALLATION COMPLETE!"
 echo "Selected Service: $SERVICE_NAME"
 echo "Domain: $DOMAIN"
+echo "Certificate source: $CERT_SOURCE"
 echo "Remnanode Port: 2222"
 echo "Checking WARP SOCKS5 proxy..."
 curl -s --connect-timeout 4 --max-time 6 -x socks5h://127.0.0.1:40000 ifconfig.me
