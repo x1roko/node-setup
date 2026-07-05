@@ -45,6 +45,12 @@ The script fully configures a server from scratch:
    ./install.sh
   ```
 
+## 🚀 Installation (in one command)
+
+```bash
+git clone https://github.com/x1roko/node-setup.git && cd node-setup && sudo chmod +x install.sh && sudo ./install.sh 
+```
+
 ## ⌨️ Input Parameters
 
 The script will prompt for:

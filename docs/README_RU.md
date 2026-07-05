@@ -44,6 +44,11 @@
   ```bash
    ./install.sh
   ```
+## 🚀 Установка одной командой
+
+```bash
+git clone https://github.com/x1roko/node-setup.git && cd node-setup && sudo chmod +x install.sh && sudo ./install.sh 
+```
 
 ## ⌨️ Параметры ввода
 
