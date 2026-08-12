@@ -99,6 +99,17 @@ SECRET_KEY=$SECRET_KEY
 SERVICE_NAME=$SERVICE_NAME
 EOF
 
+read -p "Enable BBR (TCP Congestion Control)? (y/N): " ENABLE_BBR
+
+if [[ "$ENABLE_BBR" =~ ^[Yy]$ ]]; then
+    
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+
+    sysctl -p > /dev/null 2>&1
+fi
+
 echo "--- Installing service: $SERVICE_NAME ---"
 echo "------------------------------------------------"
 
