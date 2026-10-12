@@ -303,6 +303,9 @@ ask_variable "GRPC_PATH" "gRPC Service Name/Path (e.g., /grpcpath)"
     echo "--- 5. Configuring Nginx Proxy ---"
 
     cat <<EOF > /opt/remnanode/nginx/nginx.conf
+access_log off;
+error_log /dev/null crit;
+
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ''      close;
