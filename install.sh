@@ -51,6 +51,7 @@ echo "--- Configuration ---"
 ask_variable "EMAIL" "Email (for SSL)"
 ask_variable "DOMAIN" "Domain (e.g., node.example.com)"
 ask_variable "SECRET_KEY" "SECRET_KEY (from panel)"
+ask_variable "PANEL_IP" "Panel IP (the ONLY address allowed to reach node port 2222)"
 
 # --- SERVICE SELECTION ---
 SELECTED_SERVICE=""
@@ -96,6 +97,7 @@ cat <<EOF > "$ENV_FILE"
 EMAIL=$EMAIL
 DOMAIN=$DOMAIN
 SECRET_KEY=$SECRET_KEY
+PANEL_IP=$PANEL_IP
 SERVICE_NAME=$SERVICE_NAME
 EOF
 
@@ -317,10 +319,29 @@ server {
     return 301 https://\$host\$request_uri;
 }
 
+# Drop unknown SNI instead of serving the fallback site to any hostname.
+# A real hardened web server does the same; a stub that answers every SNI
+# with the same cert/page is easy to tell apart by an active probe.
+# IMPORTANT: clients must use SNI=$DOMAIN (Reality serverNames / xhttp host),
+# otherwise their handshake is rejected with alert 112 (unrecognized_name).
+server {
+    listen unix:/dev/shm/nginx.sock ssl proxy_protocol default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+
 server {
     listen unix:/dev/shm/nginx.sock ssl proxy_protocol;
     server_name $DOMAIN;
     http2 on;
+
+    server_tokens off;
+
+    # Modern TLS only + HSTS on every response (always), including errors:
+    # a probe hitting a 404 must still see the header.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
     ssl_certificate /etc/nginx/certs/fullchain.pem;
     ssl_certificate_key /etc/nginx/certs/privkey.key;
@@ -421,7 +442,17 @@ echo "--- 7. Configuring Firewall ---"
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
-sudo ufw allow 2222/tcp
+
+# Node port must NOT be reachable from the internet: 2222 answering with a
+# self-signed cert is a ready-made marker for scanners and TSPU probes.
+# Allow the panel IP only.
+if [ -n "$PANEL_IP" ]; then
+    sudo ufw allow from "$PANEL_IP" to any port 2222 proto tcp
+else
+    echo "WARNING: PANEL_IP is empty — port 2222 stays closed."
+    echo "         The panel will NOT be able to push configs to this node."
+fi
+
 sudo ufw --force enable
 
 echo "Configuring automatic renewal via crontab..."
@@ -506,10 +537,19 @@ echo "INSTALLATION COMPLETE!"
 echo "Selected Service: $SERVICE_NAME"
 echo "Domain: $DOMAIN"
 echo "Certificate source: $CERT_SOURCE"
-echo "Remnanode Port: 2222"
+echo "Remnanode Port: 2222 (allowed from: ${PANEL_IP:-<none — closed>})"
 echo "Checking WARP SOCKS5 proxy..."
 curl -s --connect-timeout 4 --max-time 6 -x socks5h://127.0.0.1:40000 ifconfig.me
 echo ""
+echo "------------------------------------------------"
+
+echo "--- [9/9] Running self-check ---"
+if [ -f "$SCRIPT_DIR/verify.sh" ]; then
+    bash "$SCRIPT_DIR/verify.sh" "$DOMAIN" || true
+else
+    echo "verify.sh not found next to install.sh — skipped."
+fi
+
 echo "------------------------------------------------"
 # read -p "Do you want to generate a ready-to-use Xray-core server config (VLESS+REALITY)? [y/N]: " SHOW_CONFIG
 
